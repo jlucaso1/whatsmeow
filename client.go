@@ -23,10 +23,12 @@ import (
 	"go.mau.fi/util/exhttp"
 	"go.mau.fi/util/exsync"
 	"go.mau.fi/util/random"
+	wanet "go.mau.fi/whatsmeow/net"
 	"golang.org/x/net/proxy"
 
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/iface"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waWa6"
 	"go.mau.fi/whatsmeow/proto/waWeb"
@@ -65,7 +67,7 @@ type Client struct {
 	socket     *socket.NoiseSocket
 	socketLock sync.RWMutex
 	socketWait chan struct{}
-	wsDialer   *websocket.Dialer
+	wsDialer   iface.WebSocketDialer
 
 	isLoggedIn            atomic.Bool
 	expectedDisconnect    *exsync.Event
@@ -430,7 +432,7 @@ func (cli *Client) WaitForConnection(timeout time.Duration) bool {
 	return true
 }
 
-func (cli *Client) SetWSDialer(dialer *websocket.Dialer) {
+func (cli *Client) SetWSDialer(dialer iface.WebSocketDialer) {
 	cli.wsDialer = dialer
 }
 
@@ -471,21 +473,24 @@ func (cli *Client) unlockedConnect() error {
 	}
 
 	cli.resetExpectedDisconnect()
-	var wsDialer websocket.Dialer
-	if cli.wsDialer != nil {
-		wsDialer = *cli.wsDialer
-	} else if !cli.proxyOnlyLogin || cli.Store.ID == nil {
+
+	concreteDialer := &websocket.Dialer{}
+
+	if !cli.proxyOnlyLogin || cli.Store.ID == nil {
 		if cli.proxy != nil {
-			wsDialer.Proxy = cli.proxy
+			concreteDialer.Proxy = cli.proxy
 		} else if cli.socksProxy != nil {
-			wsDialer.NetDial = cli.socksProxy.Dial
+			concreteDialer.NetDial = cli.socksProxy.Dial
 			contextDialer, ok := cli.socksProxy.(proxy.ContextDialer)
 			if ok {
-				wsDialer.NetDialContext = contextDialer.DialContext
+				concreteDialer.NetDialContext = contextDialer.DialContext
 			}
 		}
 	}
-	fs := socket.NewFrameSocket(cli.Log.Sub("Socket"), wsDialer)
+
+	dialerForFrameSocket := wanet.NewGorillaDialer(concreteDialer)
+	
+	fs := socket.NewFrameSocket(cli.Log.Sub("Socket"), dialerForFrameSocket)
 	if cli.MessengerConfig != nil {
 		fs.URL = cli.MessengerConfig.WebsocketURL
 		fs.HTTPHeaders.Set("Origin", cli.MessengerConfig.BaseURL)
