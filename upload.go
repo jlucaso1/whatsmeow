@@ -17,7 +17,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
+
+	"go.mau.fi/whatsmeow/iface"
 
 	"go.mau.fi/util/random"
 
@@ -100,21 +101,14 @@ func (cli *Client) Upload(ctx context.Context, plaintext []byte, appInfo MediaTy
 // and deleted after the upload.
 //
 // To use only one file, pass the same file as both plaintext and tempFile. This will cause the file to be overwritten with encrypted data.
-func (cli *Client) UploadReader(ctx context.Context, plaintext io.Reader, tempFile io.ReadWriteSeeker, appInfo MediaType) (resp UploadResponse, err error) {
+func (cli *Client) UploadReader(ctx context.Context, plaintext iface.File, tempFile io.ReadWriteSeeker, appInfo MediaType) (resp UploadResponse, err error) {
+	if tempFile == nil {
+		return UploadResponse{}, fmt.Errorf("tempFile cannot be nil: a temporary buffer is required for encryption")
+	}
+
 	resp.MediaKey = random.Bytes(32)
 	iv, cipherKey, macKey, _ := getMediaKeys(resp.MediaKey, appInfo)
-	if tempFile == nil {
-		tempFile, err = os.CreateTemp("", "whatsmeow-upload-*")
-		if err != nil {
-			err = fmt.Errorf("failed to create temporary file: %w", err)
-			return
-		}
-		defer func() {
-			tempFileFile := tempFile.(*os.File)
-			_ = tempFileFile.Close()
-			_ = os.Remove(tempFileFile.Name())
-		}()
-	}
+
 	var uploadSize uint64
 	resp.FileSHA256, resp.FileEncSHA256, resp.FileLength, uploadSize, err = cbcutil.EncryptStream(cipherKey, iv, macKey, plaintext, tempFile)
 	if err != nil {
@@ -177,6 +171,10 @@ func (cli *Client) UploadNewsletterReader(ctx context.Context, data io.ReadSeeke
 	hasher := sha256.New()
 	var fileLength int64
 	fileLength, err = io.Copy(hasher, data)
+	if err != nil {
+		err = fmt.Errorf("failed to hash data: %w", err)
+		return
+	}
 	resp.FileLength = uint64(fileLength)
 	resp.FileSHA256 = hasher.Sum(nil)
 	_, err = data.Seek(0, io.SeekStart)

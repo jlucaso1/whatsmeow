@@ -14,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"time"
 
@@ -174,7 +173,7 @@ func (cli *Client) downloadMediaToFile(ctx context.Context, url string, file io.
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	osFile, ok := file.(*os.File)
+	osFile, ok := file.(iface.File)
 	if ok && resp.ContentLength > 0 {
 		err = fallocate.Preallocate(osFile, resp.ContentLength)
 		if err != nil {
