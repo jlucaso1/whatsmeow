@@ -75,6 +75,16 @@ interface IWhatsMeowStorage {
 	putLIDMapping(lid: string, pn: string): Promise<void>;
 	getLIDForPN(pn: string): Promise<string | null>;
 	getPNForLID(lid: string): Promise<string | null>;
+	getPreKey(keyId: number): Promise<string | null>;
+	putPreKey(keyId: number, keyData: string): Promise<void>;
+	removePreKey(keyId: number): Promise<void>;
+	getHighestPreKeyID(): Promise<number>;
+
+	getPushName(jid: string): Promise<string | null>;
+	putPushName(jid: string, name: string): Promise<void>;
+
+	getAppStateVersion(name: string): Promise<string | null>; // Returns JSON of {version, hash}
+	putAppStateVersion(name: string, data: string): Promise<void>;
 }
 
 class Storage implements IWhatsMeowStorage {
@@ -83,37 +93,73 @@ class Storage implements IWhatsMeowStorage {
 	private identities = new Map<string, Uint8Array>();
 	private lidToPn = new Map<string, string>();
 	private pnToLid = new Map<string, string>();
+	private preKeys = new Map<number, string>();
+	private pushNames = new Map<string, string>();
+	private appStateVersions = new Map<string, string>();
+	private highestPreKeyID = 0;
+
 	constructor() {
 		console.log("BRIDGE: Using ServerStorage (In-Memory).");
 	}
-	public async getDevice(jid: string) {
-		return this.devices.get(jid) || null;
-	}
-	public async putDevice(jid: string, data: string) {
+	public getDevice = async (jid: string) => this.devices.get(jid) || null;
+	public putDevice = async (jid: string, data: string) => {
 		this.devices.set(jid, data);
-	}
-	public async getSession(address: string) {
-		return this.sessions.get(address) || null;
-	}
-	public async putSession(address: string, sessionData: Uint8Array) {
-		this.sessions.set(address, sessionData);
-	}
-	public async getIdentity(address: string): Promise<Uint8Array | null> {
-		return this.identities.get(address) || null;
-	}
-	public async putIdentity(address: string, key: Uint8Array): Promise<void> {
+	};
+
+	public getSession = async (address: string) =>
+		this.sessions.get(address) || null;
+	public putSession = async (address: string, data: Uint8Array) => {
+		this.sessions.set(address, data);
+	};
+	public deleteSession = async (address: string) => {
+		this.sessions.delete(address);
+	};
+	public getAllSessionsFor = async (phone: string) => {
+		const result: Record<string, Uint8Array> = {};
+		for (const [key, value] of this.sessions.entries()) {
+			if (key.startsWith(phone)) {
+				result[key] = value;
+			}
+		}
+		return result;
+	};
+
+	public getIdentity = async (address: string) =>
+		this.identities.get(address) || null;
+	public putIdentity = async (address: string, key: Uint8Array) => {
 		this.identities.set(address, key);
-	}
-	public async putLIDMapping(lid: string, pn: string): Promise<void> {
+	};
+
+	public putLIDMapping = async (lid: string, pn: string) => {
 		this.lidToPn.set(lid, pn);
 		this.pnToLid.set(pn, lid);
-	}
-	public async getLIDForPN(pn: string): Promise<string | null> {
-		return this.pnToLid.get(pn) || null;
-	}
-	public async getPNForLID(lid: string): Promise<string | null> {
-		return this.lidToPn.get(lid) || null;
-	}
+	};
+	public getLIDForPN = async (pn: string) => this.pnToLid.get(pn) || null;
+	public getPNForLID = async (lid: string) => this.lidToPn.get(lid) || null;
+
+	public getPreKey = async (keyId: number) => this.preKeys.get(keyId) || null;
+	public putPreKey = async (keyId: number, keyData: string) => {
+		this.preKeys.set(keyId, keyData);
+		if (keyId > this.highestPreKeyID) {
+			this.highestPreKeyID = keyId;
+		}
+	};
+	public removePreKey = async (keyId: number) => {
+		this.preKeys.delete(keyId);
+	};
+	public getHighestPreKeyID = async (): Promise<number> =>
+		this.highestPreKeyID;
+
+	public getPushName = async (jid: string) => this.pushNames.get(jid) || null;
+	public putPushName = async (jid: string, name: string) => {
+		this.pushNames.set(jid, name);
+	};
+
+	public getAppStateVersion = async (name: string) =>
+		this.appStateVersions.get(name) || null;
+	public putAppStateVersion = async (name: string, data: string) => {
+		this.appStateVersions.set(name, data);
+	};
 }
 
 (globalThis as any).displayQRCode = whatsmeowBridge.displayQRCode;

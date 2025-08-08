@@ -1,4 +1,5 @@
-// Filename: js_dialer_wasm.go
+//go:build wasm
+
 package whatsmeow
 
 import (
@@ -13,7 +14,6 @@ import (
 	"go.mau.fi/whatsmeow/iface"
 )
 
-// jsWebSocketDialer implements the WebSocketDialer interface using JS bindings.
 type jsWebSocketDialer struct{}
 
 func NewJSDialer() iface.WebSocketDialer {
@@ -35,7 +35,6 @@ func (d *jsWebSocketDialer) DialContext(ctx context.Context, urlStr string, requ
 		"onClose":   conn.onCloseFunc,
 	})
 
-	// Ensure callbacks are released when the connection is done to prevent memory leaks
 	go func() {
 		<-conn.closeCh
 		conn.onOpenFunc.Release()
@@ -52,7 +51,6 @@ func (d *jsWebSocketDialer) DialContext(ctx context.Context, urlStr string, requ
 
 	select {
 	case <-conn.openChan:
-		// The response is faked since the JS WebSocket API doesn't expose it.
 		return conn, &http.Response{StatusCode: http.StatusSwitchingProtocols}, nil
 	case <-conn.closeCh:
 		return nil, nil, conn.closeErr
@@ -62,7 +60,6 @@ func (d *jsWebSocketDialer) DialContext(ctx context.Context, urlStr string, requ
 	}
 }
 
-// jsWebSocketConnection implements the WebSocketConnection interface.
 type jsWebSocketConnection struct {
 	jsConn js.Value
 
@@ -71,7 +68,7 @@ type jsWebSocketConnection struct {
 
 	closeOnce sync.Once
 	closeErr  error
-	closeCh   chan struct{} // This channel is closed to signal that the connection is down.
+	closeCh   chan struct{}
 
 	onOpenFunc    js.Func
 	onMessageFunc js.Func
@@ -87,20 +84,17 @@ func newJSWebSocketConnection() *jsWebSocketConnection {
 	}
 }
 
-// closeWithError is the single, thread-safe entry point for shutting down the connection.
 func (c *jsWebSocketConnection) closeWithError(err error) {
 	c.closeOnce.Do(func() {
 		c.closeErr = err
-		close(c.closeCh) // Signal closure to all listeners.
+		close(c.closeCh)
 		close(c.readChan)
-		// Attempt to close the JS websocket gracefully.
 		if c.jsConn.Truthy() {
 			c.jsConn.Call("close", 1000, "Normal Closure")
 		}
 	})
 }
 
-// Callbacks for JS to invoke
 func (c *jsWebSocketConnection) onOpen(this js.Value, args []js.Value) any {
 	close(c.openChan)
 	return nil
@@ -109,7 +103,7 @@ func (c *jsWebSocketConnection) onOpen(this js.Value, args []js.Value) any {
 func (c *jsWebSocketConnection) onMessage(this js.Value, args []js.Value) any {
 	select {
 	case <-c.closeCh:
-		return nil // Connection is closed, ignore incoming messages
+		return nil
 	default:
 	}
 	jsData := args[0]
@@ -129,7 +123,6 @@ func (c *jsWebSocketConnection) onClose(this js.Value, args []js.Value) any {
 	return nil
 }
 
-// Interface implementations
 func (c *jsWebSocketConnection) ReadMessage() (messageType int, p []byte, err error) {
 	select {
 	case <-c.closeCh:
@@ -159,7 +152,6 @@ func (c *jsWebSocketConnection) Close() error {
 	return nil
 }
 
-// The following methods are no-ops in a browser environment but are required to fulfill the interface.
 func (c *jsWebSocketConnection) SetReadDeadline(t time.Time) error                         { return nil }
 func (c *jsWebSocketConnection) SetWriteDeadline(t time.Time) error                        { return nil }
 func (c *jsWebSocketConnection) SetCloseHandler(handler func(code int, text string) error) {}

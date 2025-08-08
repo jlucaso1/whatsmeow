@@ -11,6 +11,7 @@ import (
 	"syscall/js"
 	"time"
 
+	"go.mau.fi/libsignal/protocol"
 	"go.mau.fi/util/random"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
@@ -28,9 +29,15 @@ type serializableDevice struct {
 	AdvSecretKey   []byte `json:"advSecretKey"`
 	JID            string `json:"jid"`
 }
+type serializablePreKey struct {
+	ID         uint32   `json:"id"`
+	PrivateKey [32]byte `json:"privateKey"`
+}
+type serializableAppStateVersion struct {
+	Version uint64 `json:"version"`
+	Hash    []byte `json:"hash"`
+}
 
-// Static assertions to ensure JSStore implements the required interfaces.
-// The compiler will fail here if any methods are missing.
 var _ store.DeviceContainer = (*JSStore)(nil)
 var _ store.AllStores = (*JSStore)(nil)
 
@@ -38,8 +45,6 @@ type JSStore struct {
 	jsStorage js.Value
 }
 
-// NewJSStore creates a new JSStore bridge. It will panic if the required
-// `window.whatsmeowStorage` object is not found in the host JavaScript environment.
 func NewJSStore() *JSStore {
 	jsStorage := js.Global().Get("whatsmeowStorage")
 	if !jsStorage.Truthy() {
@@ -48,17 +53,12 @@ func NewJSStore() *JSStore {
 	return &JSStore{jsStorage: jsStorage}
 }
 
-// --- Implementation of store.DeviceContainer ---
-
-// NewDevice creates a new device configuration for whatsmeow.
-// It correctly wires up the device to use this JS bridge for all its storage needs.
 func (s *JSStore) NewDevice() *store.Device {
 	device := &store.Device{}
-	s.wireUpStores(device) // IMPORTANT: Wire up all interfaces
+	s.wireUpStores(device)
 
 	device.NoiseKey = keys.NewKeyPair()
 	device.IdentityKey = keys.NewKeyPair()
-	// The KeyID for the signed prekey is always 1
 	device.SignedPreKey = device.IdentityKey.CreateSignedPreKey(1)
 	device.RegistrationID = uint32(rand.Intn(16380)) + 1
 	device.AdvSecretKey = random.Bytes(32)
@@ -66,8 +66,6 @@ func (s *JSStore) NewDevice() *store.Device {
 	return device
 }
 
-// GetFirstDevice should fetch the primary device from the JS storage layer.
-// For now, it creates a new device, but this should be expanded to load existing data.
 func (s *JSStore) GetFirstDevice(ctx context.Context) (*store.Device, error) {
 	promise := s.jsStorage.Call("getDevice", singleDeviceJID)
 	result, err := awaitPromise(promise)
@@ -76,11 +74,9 @@ func (s *JSStore) GetFirstDevice(ctx context.Context) (*store.Device, error) {
 	}
 
 	if !result.Truthy() {
-		// No device found, create a new one
 		return s.NewDevice(), nil
 	}
 
-	// Device found, deserialize it
 	jsonData := result.String()
 	var saved serializableDevice
 	if err := json.Unmarshal([]byte(jsonData), &saved); err != nil {
@@ -105,7 +101,6 @@ func (s *JSStore) GetFirstDevice(ctx context.Context) (*store.Device, error) {
 	return device, nil
 }
 
-// GetDevice is not yet implemented for the JS bridge.
 func (s *JSStore) GetDevice(ctx context.Context, jid types.JID) (*store.Device, error) {
 	return nil, errors.New("GetDevice not yet implemented for jsstore")
 }
@@ -151,12 +146,9 @@ func (s *JSStore) wireUpStores(device *store.Device) {
 	device.LIDs = s
 }
 
-// DeleteDevice is not yet implemented for the JS bridge.
 func (s *JSStore) DeleteDevice(ctx context.Context, device *store.Device) error {
 	return errors.New("DeleteDevice not implemented")
 }
-
-// --- Helper for awaiting JS Promises ---
 
 func awaitPromise(promise js.Value) (js.Value, error) {
 	if promise.IsUndefined() || promise.IsNull() {
@@ -184,8 +176,6 @@ func awaitPromise(promise js.Value) (js.Value, error) {
 		return js.Undefined(), err
 	}
 }
-
-// --- Implementation of store.AllStores (Sessions are already implemented) ---
 
 func (s *JSStore) PutSession(ctx context.Context, address string, session []byte) error {
 	jsMethod := s.jsStorage.Get("putSession")
@@ -241,7 +231,7 @@ func (s *JSStore) IsTrustedIdentity(ctx context.Context, address string, key [32
 		return false, err
 	}
 	if !result.Truthy() {
-		return true, nil // Trust on first use
+		return true, nil
 	}
 	existingKey := make([]byte, result.Get("length").Int())
 	js.CopyBytesToGo(existingKey, result)
@@ -272,7 +262,130 @@ func (s *JSStore) GetPNForLID(ctx context.Context, lid types.JID) (types.JID, er
 	return types.ParseJID(result.String())
 }
 
-// --- Stubs for the rest of store.AllStores ---
+func (s *JSStore) GetPreKey(ctx context.Context, id uint32) (*keys.PreKey, error) {
+	promise := s.jsStorage.Call("getPreKey", id)
+	result, err := awaitPromise(promise)
+	if err != nil {
+		return nil, fmt.Errorf("js getPreKey failed: %w", err)
+	}
+	if !result.Truthy() {
+		return nil, nil
+	}
+	var saved serializablePreKey
+	if err := json.Unmarshal([]byte(result.String()), &saved); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal prekey: %w", err)
+	}
+	return keys.NewKeyPairFromPrivateKey(saved.PrivateKey).CreateSignedPreKey(saved.ID), nil
+}
+
+func (s *JSStore) PutPreKey(id uint32, priv [32]byte) error {
+	saved := serializablePreKey{ID: id, PrivateKey: priv}
+	jsonData, err := json.Marshal(saved)
+	if err != nil {
+		return fmt.Errorf("failed to marshal prekey: %w", err)
+	}
+	promise := s.jsStorage.Call("putPreKey", id, string(jsonData))
+	_, err = awaitPromise(promise)
+	return err
+}
+
+func (s *JSStore) GetOrGenPreKeys(ctx context.Context, count uint32) ([]*keys.PreKey, error) {
+	promise := s.jsStorage.Call("getHighestPreKeyID")
+	result, err := awaitPromise(promise)
+	if err != nil {
+		return nil, fmt.Errorf("js getHighestPreKeyID failed: %w", err)
+	}
+	nextID := uint32(result.Int()) + 1
+
+	var preKeys []*keys.PreKey
+	for i := uint32(0); i < count; i++ {
+		keyID := nextID + i
+		kp := keys.NewKeyPair()
+		if err := s.PutPreKey(keyID, *kp.Priv); err != nil {
+			return nil, fmt.Errorf("failed to store generated prekey %d: %w", keyID, err)
+		}
+		preKeys = append(preKeys, kp.CreateSignedPreKey(keyID))
+	}
+	return preKeys, nil
+}
+
+func (s *JSStore) GenOnePreKey(ctx context.Context) (*keys.PreKey, error) {
+	kp := keys.NewKeyPair()
+	newID := uint32(time.Now().Unix())
+	if err := s.PutPreKey(newID, *kp.Priv); err != nil {
+		return nil, err
+	}
+	return kp.CreateSignedPreKey(newID), nil
+}
+
+func (s *JSStore) RemovePreKey(ctx context.Context, id uint32) error {
+	promise := s.jsStorage.Call("removePreKey", id)
+	_, err := awaitPromise(promise)
+	return err
+}
+
+func (s *JSStore) UploadedPreKeyCount(ctx context.Context) (int, error) { return 0, nil }
+
+func (s *JSStore) MarkPreKeysAsUploaded(ctx context.Context, upToID uint32) error {
+	return nil
+}
+
+func (s *JSStore) PutAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte) error {
+	data := serializableAppStateVersion{Version: version, Hash: hash[:]}
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	promise := s.jsStorage.Call("putAppStateVersion", name, string(jsonData))
+	_, err = awaitPromise(promise)
+	return err
+}
+
+func (s *JSStore) GetAppStateVersion(ctx context.Context, name string) (uint64, [128]byte, error) {
+	promise := s.jsStorage.Call("getAppStateVersion", name)
+	result, err := awaitPromise(promise)
+	if err != nil {
+		return 0, [128]byte{}, err
+	}
+	if !result.Truthy() {
+		return 0, [128]byte{}, nil // Not found is a valid initial state
+	}
+	var data serializableAppStateVersion
+	if err := json.Unmarshal([]byte(result.String()), &data); err != nil {
+		return 0, [128]byte{}, err
+	}
+	var hash [128]byte
+	copy(hash[:], data.Hash)
+	return data.Version, hash, nil
+}
+
+// --- ContactStore ---
+func (s *JSStore) PutPushName(ctx context.Context, user types.JID, pushName string) (bool, string, error) {
+	promise := s.jsStorage.Call("putPushName", user.String(), pushName)
+	_, err := awaitPromise(promise)
+	return true, "", err // Return true to indicate a change was made
+}
+
+// --- SessionStore ---
+func (s *JSStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
+	pnStr := protocol.NewSignalAddress(pn.User, uint32(pn.Device)).String()
+	lidStr := protocol.NewSignalAddress(lid.User, uint32(lid.Device)).String()
+
+	// Get PN session
+	sessionBytes, err := s.GetSession(ctx, pnStr)
+	if err != nil {
+		return err
+	}
+	if len(sessionBytes) == 0 {
+		return nil // No session to migrate
+	}
+
+	// Put it at the LID address and delete the PN address
+	if err := s.PutSession(ctx, lidStr, sessionBytes); err != nil {
+		return err
+	}
+	return s.DeleteSession(ctx, pnStr)
+}
 
 func (s *JSStore) DeleteAllIdentities(ctx context.Context, phone string) error {
 	return errors.New("not implemented")
@@ -289,27 +402,6 @@ func (s *JSStore) DeleteAllSessions(ctx context.Context, phone string) error {
 func (s *JSStore) DeleteSession(ctx context.Context, address string) error {
 	return errors.New("not implemented")
 }
-func (s *JSStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
-	return errors.New("not implemented")
-}
-func (s *JSStore) GetOrGenPreKeys(ctx context.Context, count uint32) ([]*keys.PreKey, error) {
-	return nil, errors.New("not implemented")
-}
-func (s *JSStore) GenOnePreKey(ctx context.Context) (*keys.PreKey, error) {
-	return nil, errors.New("not implemented")
-}
-func (s *JSStore) GetPreKey(ctx context.Context, id uint32) (*keys.PreKey, error) {
-	return nil, errors.New("not implemented")
-}
-func (s *JSStore) RemovePreKey(ctx context.Context, id uint32) error {
-	return errors.New("not implemented")
-}
-func (s *JSStore) MarkPreKeysAsUploaded(ctx context.Context, upToID uint32) error {
-	return errors.New("not implemented")
-}
-func (s *JSStore) UploadedPreKeyCount(ctx context.Context) (int, error) {
-	return 0, errors.New("not implemented")
-}
 func (s *JSStore) PutSenderKey(ctx context.Context, group, user string, session []byte) error {
 	return errors.New("not implemented")
 }
@@ -325,12 +417,6 @@ func (s *JSStore) GetAppStateSyncKey(ctx context.Context, id []byte) (*store.App
 func (s *JSStore) GetLatestAppStateSyncKeyID(ctx context.Context) ([]byte, error) {
 	return nil, errors.New("not implemented")
 }
-func (s *JSStore) PutAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte) error {
-	return errors.New("not implemented")
-}
-func (s *JSStore) GetAppStateVersion(ctx context.Context, name string) (uint64, [128]byte, error) {
-	return 0, [128]byte{}, errors.New("not implemented")
-}
 func (s *JSStore) DeleteAppStateVersion(ctx context.Context, name string) error {
 	return errors.New("not implemented")
 }
@@ -342,9 +428,6 @@ func (s *JSStore) DeleteAppStateMutationMACs(ctx context.Context, name string, i
 }
 func (s *JSStore) GetAppStateMutationMAC(ctx context.Context, name string, indexMAC []byte) (valueMAC []byte, err error) {
 	return nil, errors.New("not implemented")
-}
-func (s *JSStore) PutPushName(ctx context.Context, user types.JID, pushName string) (bool, string, error) {
-	return false, "", errors.New("not implemented")
 }
 func (s *JSStore) PutBusinessName(ctx context.Context, user types.JID, businessName string) (bool, string, error) {
 	return false, "", errors.New("not implemented")
