@@ -9,6 +9,12 @@ import (
 	"go.mau.fi/whatsmeow/iface"
 )
 
+func NewDefaultGorillaDialer() *GorillaDialer {
+	return &GorillaDialer{
+		Dialer: &websocket.Dialer{},
+	}
+}
+
 type gorillaConn struct {
 	*websocket.Conn
 }
