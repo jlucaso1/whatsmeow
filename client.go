@@ -176,7 +176,7 @@ type Client struct {
 	proxy          Proxy
 	socksProxy     proxy.Dialer
 	proxyOnlyLogin bool
-	http           *http.Client
+	http           iface.HTTPClient
 
 	// This field changes the client to act like a Messenger client instead of a WhatsApp one.
 	//
@@ -337,7 +337,16 @@ func (cli *Client) SetProxy(proxy Proxy, opts ...SetProxyOptions) {
 		cli.socksProxy = nil
 	}
 	if !opt.NoMedia {
-		transport := cli.http.Transport.(*http.Transport)
+		stdClient, ok := cli.http.(*http.Client)
+		if !ok {
+			cli.Log.Warnf("Cannot set HTTP proxy on a custom HTTP client implementation")
+			return
+		}
+		transport, ok := stdClient.Transport.(*http.Transport)
+		if !ok {
+			cli.Log.Warnf("Cannot set HTTP proxy on a non-standard http.Transport")
+			return
+		}
 		transport.Proxy = proxy
 		transport.Dial = nil
 		transport.DialContext = nil
@@ -364,10 +373,19 @@ func (cli *Client) SetSOCKSProxy(px proxy.Dialer, opts ...SetProxyOptions) {
 		cli.proxy = nil
 	}
 	if !opt.NoMedia {
-		transport := cli.http.Transport.(*http.Transport)
+		stdClient, ok := cli.http.(*http.Client)
+		if !ok {
+			cli.Log.Warnf("Cannot set SOCKS proxy on a custom HTTP client implementation")
+			return
+		}
+		transport, ok := stdClient.Transport.(*http.Transport)
+		if !ok {
+			cli.Log.Warnf("Cannot set SOCKS proxy on a non-standard http.Transport")
+			return
+		}
 		transport.Proxy = nil
-		transport.Dial = cli.socksProxy.Dial
-		contextDialer, ok := cli.socksProxy.(proxy.ContextDialer)
+		transport.Dial = px.Dial
+		contextDialer, ok := px.(proxy.ContextDialer)
 		if ok {
 			transport.DialContext = contextDialer.DialContext
 		} else {
@@ -489,7 +507,7 @@ func (cli *Client) unlockedConnect() error {
 	}
 
 	dialerForFrameSocket := wanet.NewGorillaDialer(concreteDialer)
-	
+
 	fs := socket.NewFrameSocket(cli.Log.Sub("Socket"), dialerForFrameSocket)
 	if cli.MessengerConfig != nil {
 		fs.URL = cli.MessengerConfig.WebsocketURL
