@@ -24,6 +24,7 @@ import (
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/iface"
+	wanet "go.mau.fi/whatsmeow/net"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waWa6"
 	"go.mau.fi/whatsmeow/proto/waWeb"
@@ -220,6 +221,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		http: &http.Client{
 			Transport: (http.DefaultTransport.(*http.Transport)).Clone(),
 		},
+		wsDialer: wanet.NewDefaultGorillaDialer(),
 		Store:              deviceStore,
 		Log:                log,
 		recvLog:            log.Sub("Recv"),
