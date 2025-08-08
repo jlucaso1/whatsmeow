@@ -4,6 +4,7 @@ package jsstore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -15,6 +16,18 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/util/keys"
 )
+
+const singleDeviceJID = "my-device"
+
+type serializableDevice struct {
+	NoiseKey       []byte `json:"noiseKey"`
+	IdentityKey    []byte `json:"identityKey"`
+	SignedPreKey   []byte `json:"signedPreKey"`
+	SignedPreKeyID uint32 `json:"signedPreKeyId"`
+	RegistrationID uint32 `json:"registrationId"`
+	AdvSecretKey   []byte `json:"advSecretKey"`
+	JID            string `json:"jid"`
+}
 
 // Static assertions to ensure JSStore implements the required interfaces.
 // The compiler will fail here if any methods are missing.
@@ -41,13 +54,88 @@ func NewJSStore() *JSStore {
 // It correctly wires up the device to use this JS bridge for all its storage needs.
 func (s *JSStore) NewDevice() *store.Device {
 	device := &store.Device{}
+	s.wireUpStores(device) // IMPORTANT: Wire up all interfaces
 
 	device.NoiseKey = keys.NewKeyPair()
 	device.IdentityKey = keys.NewKeyPair()
+	// The KeyID for the signed prekey is always 1
 	device.SignedPreKey = device.IdentityKey.CreateSignedPreKey(1)
 	device.RegistrationID = uint32(rand.Intn(16380)) + 1
 	device.AdvSecretKey = random.Bytes(32)
-	// Wire up all the storage interfaces to this JSStore instance.
+
+	return device
+}
+
+// GetFirstDevice should fetch the primary device from the JS storage layer.
+// For now, it creates a new device, but this should be expanded to load existing data.
+func (s *JSStore) GetFirstDevice(ctx context.Context) (*store.Device, error) {
+	promise := s.jsStorage.Call("getDevice", singleDeviceJID)
+	result, err := awaitPromise(promise)
+	if err != nil {
+		return nil, fmt.Errorf("js getDevice failed: %w", err)
+	}
+
+	if !result.Truthy() {
+		// No device found, create a new one
+		return s.NewDevice(), nil
+	}
+
+	// Device found, deserialize it
+	jsonData := result.String()
+	var saved serializableDevice
+	if err := json.Unmarshal([]byte(jsonData), &saved); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal device JSON: %w", err)
+	}
+
+	jid, err := types.ParseJID(saved.JID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse JID from saved device: %w", err)
+	}
+
+	device := &store.Device{
+		ID:             &jid,
+		NoiseKey:       keys.NewKeyPairFromPrivateKey(as32Byte(saved.NoiseKey)),
+		IdentityKey:    keys.NewKeyPairFromPrivateKey(as32Byte(saved.IdentityKey)),
+		SignedPreKey:   keys.NewKeyPairFromPrivateKey(as32Byte(saved.SignedPreKey)).CreateSignedPreKey(saved.SignedPreKeyID),
+		RegistrationID: saved.RegistrationID,
+		AdvSecretKey:   saved.AdvSecretKey,
+	}
+
+	s.wireUpStores(device)
+	return device, nil
+}
+
+// GetDevice is not yet implemented for the JS bridge.
+func (s *JSStore) GetDevice(ctx context.Context, jid types.JID) (*store.Device, error) {
+	return nil, errors.New("GetDevice not yet implemented for jsstore")
+}
+
+func (s *JSStore) PutDevice(ctx context.Context, device *store.Device) error {
+	if device.ID == nil {
+		return errors.New("cannot put device with nil JID")
+	}
+
+	saved := serializableDevice{
+		NoiseKey:       (*device.NoiseKey.Priv)[:],
+		IdentityKey:    (*device.IdentityKey.Priv)[:],
+		SignedPreKey:   (*device.SignedPreKey.Priv)[:],
+		SignedPreKeyID: device.SignedPreKey.KeyID,
+		RegistrationID: device.RegistrationID,
+		AdvSecretKey:   device.AdvSecretKey,
+		JID:            device.ID.String(),
+	}
+
+	jsonData, err := json.Marshal(saved)
+	if err != nil {
+		return fmt.Errorf("failed to marshal device to JSON: %w", err)
+	}
+
+	promise := s.jsStorage.Call("putDevice", singleDeviceJID, string(jsonData))
+	_, err = awaitPromise(promise)
+	return err
+}
+
+func (s *JSStore) wireUpStores(device *store.Device) {
 	device.Container = s
 	device.Identities = s
 	device.Sessions = s
@@ -61,24 +149,6 @@ func (s *JSStore) NewDevice() *store.Device {
 	device.PrivacyTokens = s
 	device.EventBuffer = s
 	device.LIDs = s
-	return device
-}
-
-// GetFirstDevice should fetch the primary device from the JS storage layer.
-// For now, it creates a new device, but this should be expanded to load existing data.
-func (s *JSStore) GetFirstDevice(ctx context.Context) (*store.Device, error) {
-	// CORRECTED: Call the method on the instance 's', not the package 'store'.
-	return s.NewDevice(), nil
-}
-
-// GetDevice is not yet implemented for the JS bridge.
-func (s *JSStore) GetDevice(ctx context.Context, jid types.JID) (*store.Device, error) {
-	return nil, errors.New("GetDevice not yet implemented for jsstore")
-}
-
-// PutDevice is not yet implemented for the JS bridge.
-func (s *JSStore) PutDevice(ctx context.Context, device *store.Device) error {
-	return errors.New("PutDevice not implemented")
 }
 
 // DeleteDevice is not yet implemented for the JS bridge.
@@ -150,19 +220,65 @@ func (s *JSStore) GetSession(ctx context.Context, address string) ([]byte, error
 	return goBytes, nil
 }
 
-// --- Stubs for the rest of store.AllStores ---
+func as32Byte(b []byte) [32]byte {
+	var a [32]byte
+	copy(a[:], b)
+	return a
+}
 
 func (s *JSStore) PutIdentity(ctx context.Context, address string, key [32]byte) error {
-	return errors.New("not implemented")
+	jsBuffer := js.Global().Get("Uint8Array").New(len(key))
+	js.CopyBytesToJS(jsBuffer, key[:])
+	promise := s.jsStorage.Call("putIdentity", address, jsBuffer)
+	_, err := awaitPromise(promise)
+	return err
 }
+
+func (s *JSStore) IsTrustedIdentity(ctx context.Context, address string, key [32]byte) (bool, error) {
+	promise := s.jsStorage.Call("getIdentity", address)
+	result, err := awaitPromise(promise)
+	if err != nil {
+		return false, err
+	}
+	if !result.Truthy() {
+		return true, nil // Trust on first use
+	}
+	existingKey := make([]byte, result.Get("length").Int())
+	js.CopyBytesToGo(existingKey, result)
+	return [32]byte(existingKey) == key, nil
+}
+
+func (s *JSStore) PutLIDMapping(ctx context.Context, lid types.JID, pn types.JID) error {
+	promise := s.jsStorage.Call("putLIDMapping", lid.String(), pn.String())
+	_, err := awaitPromise(promise)
+	return err
+}
+
+func (s *JSStore) GetLIDForPN(ctx context.Context, pn types.JID) (types.JID, error) {
+	promise := s.jsStorage.Call("getLIDForPN", pn.String())
+	result, err := awaitPromise(promise)
+	if err != nil || !result.Truthy() {
+		return types.JID{}, err
+	}
+	return types.ParseJID(result.String())
+}
+
+func (s *JSStore) GetPNForLID(ctx context.Context, lid types.JID) (types.JID, error) {
+	promise := s.jsStorage.Call("getPNForLID", lid.String())
+	result, err := awaitPromise(promise)
+	if err != nil || !result.Truthy() {
+		return types.JID{}, err
+	}
+	return types.ParseJID(result.String())
+}
+
+// --- Stubs for the rest of store.AllStores ---
+
 func (s *JSStore) DeleteAllIdentities(ctx context.Context, phone string) error {
 	return errors.New("not implemented")
 }
 func (s *JSStore) DeleteIdentity(ctx context.Context, address string) error {
 	return errors.New("not implemented")
-}
-func (s *JSStore) IsTrustedIdentity(ctx context.Context, address string, key [32]byte) (bool, error) {
-	return false, errors.New("not implemented")
 }
 func (s *JSStore) HasSession(ctx context.Context, address string) (bool, error) {
 	return false, errors.New("not implemented")
@@ -287,15 +403,6 @@ func (s *JSStore) ClearBufferedEventPlaintext(ctx context.Context, ciphertextHas
 func (s *JSStore) DeleteOldBufferedHashes(ctx context.Context) error {
 	return errors.New("not implemented")
 }
-func (s *JSStore) GetLIDForPN(ctx context.Context, pn types.JID) (types.JID, error) {
-	return types.JID{}, errors.New("not implemented")
-}
-func (s *JSStore) GetPNForLID(ctx context.Context, lid types.JID) (types.JID, error) {
-	return types.JID{}, errors.New("not implemented")
-}
 func (s *JSStore) PutManyLIDMappings(ctx context.Context, mappings []store.LIDMapping) error {
-	return errors.New("not implemented")
-}
-func (s *JSStore) PutLIDMapping(ctx context.Context, lid types.JID, jid types.JID) error {
 	return errors.New("not implemented")
 }

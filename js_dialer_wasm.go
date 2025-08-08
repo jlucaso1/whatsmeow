@@ -1,10 +1,10 @@
-//go:build wasm
-
+// Filename: js_dialer_wasm.go
 package whatsmeow
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"syscall/js"
@@ -23,49 +23,81 @@ func NewJSDialer() iface.WebSocketDialer {
 func (d *jsWebSocketDialer) DialContext(ctx context.Context, urlStr string, requestHeader http.Header) (iface.WebSocketConnection, *http.Response, error) {
 	conn := newJSWebSocketConnection()
 
+	conn.onOpenFunc = js.FuncOf(conn.onOpen)
+	conn.onMessageFunc = js.FuncOf(conn.onMessage)
+	conn.onErrorFunc = js.FuncOf(conn.onError)
+	conn.onCloseFunc = js.FuncOf(conn.onClose)
+
 	callbacks := js.ValueOf(map[string]interface{}{
-		"onOpen":    js.FuncOf(conn.onOpen),
-		"onMessage": js.FuncOf(conn.onMessage),
-		"onError":   js.FuncOf(conn.onError),
-		"onClose":   js.FuncOf(conn.onClose),
+		"onOpen":    conn.onOpenFunc,
+		"onMessage": conn.onMessageFunc,
+		"onError":   conn.onErrorFunc,
+		"onClose":   conn.onCloseFunc,
 	})
+
+	// Ensure callbacks are released when the connection is done to prevent memory leaks
+	go func() {
+		<-conn.closeCh
+		conn.onOpenFunc.Release()
+		conn.onMessageFunc.Release()
+		conn.onErrorFunc.Release()
+		conn.onCloseFunc.Release()
+	}()
 
 	jsConn := js.Global().Call("dialWebSocket", urlStr, callbacks)
 	if !jsConn.Truthy() {
-		return nil, nil, errors.New("failed to dial websocket via JS bridge")
+		return nil, nil, errors.New("failed to dial websocket via JS bridge: dialWebSocket call failed")
 	}
 	conn.jsConn = jsConn
 
-	// Wait for the connection to be established or for the context to be cancelled.
 	select {
 	case <-conn.openChan:
 		// The response is faked since the JS WebSocket API doesn't expose it.
 		return conn, &http.Response{StatusCode: http.StatusSwitchingProtocols}, nil
-	case err := <-conn.errChan:
-		return nil, nil, err
+	case <-conn.closeCh:
+		return nil, nil, conn.closeErr
 	case <-ctx.Done():
+		conn.closeWithError(ctx.Err())
 		return nil, nil, ctx.Err()
 	}
 }
 
 // jsWebSocketConnection implements the WebSocketConnection interface.
 type jsWebSocketConnection struct {
-	jsConn js.Value // The JS object with { writeMessage, close }
+	jsConn js.Value
 
 	readChan chan []byte
-	errChan  chan error
 	openChan chan struct{}
 
 	closeOnce sync.Once
-	readMutex sync.Mutex
+	closeErr  error
+	closeCh   chan struct{} // This channel is closed to signal that the connection is down.
+
+	onOpenFunc    js.Func
+	onMessageFunc js.Func
+	onErrorFunc   js.Func
+	onCloseFunc   js.Func
 }
 
 func newJSWebSocketConnection() *jsWebSocketConnection {
 	return &jsWebSocketConnection{
-		readChan: make(chan []byte, 100), // Buffer to hold incoming messages
-		errChan:  make(chan error, 1),
+		readChan: make(chan []byte, 100),
 		openChan: make(chan struct{}, 1),
+		closeCh:  make(chan struct{}),
 	}
+}
+
+// closeWithError is the single, thread-safe entry point for shutting down the connection.
+func (c *jsWebSocketConnection) closeWithError(err error) {
+	c.closeOnce.Do(func() {
+		c.closeErr = err
+		close(c.closeCh) // Signal closure to all listeners.
+		close(c.readChan)
+		// Attempt to close the JS websocket gracefully.
+		if c.jsConn.Truthy() {
+			c.jsConn.Call("close", 1000, "Normal Closure")
+		}
+	})
 }
 
 // Callbacks for JS to invoke
@@ -73,48 +105,61 @@ func (c *jsWebSocketConnection) onOpen(this js.Value, args []js.Value) any {
 	close(c.openChan)
 	return nil
 }
+
 func (c *jsWebSocketConnection) onMessage(this js.Value, args []js.Value) any {
+	select {
+	case <-c.closeCh:
+		return nil // Connection is closed, ignore incoming messages
+	default:
+	}
 	jsData := args[0]
 	goBytes := make([]byte, jsData.Get("length").Int())
 	js.CopyBytesToGo(goBytes, jsData)
 	c.readChan <- goBytes
 	return nil
 }
+
 func (c *jsWebSocketConnection) onError(this js.Value, args []js.Value) any {
-	errStr := args[0].String()
-	c.errChan <- errors.New(errStr)
+	c.closeWithError(fmt.Errorf("websocket error: %s", args[0].String()))
 	return nil
 }
+
 func (c *jsWebSocketConnection) onClose(this js.Value, args []js.Value) any {
-	c.errChan <- errors.New("websocket closed by remote")
+	c.closeWithError(errors.New("websocket closed by remote"))
 	return nil
 }
 
 // Interface implementations
 func (c *jsWebSocketConnection) ReadMessage() (messageType int, p []byte, err error) {
-	c.readMutex.Lock()
-	defer c.readMutex.Unlock()
 	select {
-	case msg := <-c.readChan:
+	case <-c.closeCh:
+		return -1, nil, c.closeErr
+	case msg, ok := <-c.readChan:
+		if !ok {
+			return -1, nil, c.closeErr
+		}
 		return iface.BinaryMessage, msg, nil
-	case err := <-c.errChan:
-		return -1, nil, err
 	}
 }
+
 func (c *jsWebSocketConnection) WriteMessage(messageType int, data []byte) error {
-	jsBuffer := js.Global().Get("Uint8Array").New(len(data))
-	js.CopyBytesToJS(jsBuffer, data)
-	c.jsConn.Call("writeMessage", jsBuffer)
-	return nil
+	select {
+	case <-c.closeCh:
+		return c.closeErr
+	default:
+		jsBuffer := js.Global().Get("Uint8Array").New(len(data))
+		js.CopyBytesToJS(jsBuffer, data)
+		c.jsConn.Call("writeMessage", jsBuffer)
+		return nil
+	}
 }
+
 func (c *jsWebSocketConnection) Close() error {
-	c.closeOnce.Do(func() {
-		c.jsConn.Call("close", 1000, "Normal Closure")
-		close(c.errChan)
-		close(c.readChan)
-	})
+	c.closeWithError(errors.New("connection closed by client"))
 	return nil
 }
-func (c *jsWebSocketConnection) SetReadDeadline(t time.Time) error                         { return nil } // No-op in JS
-func (c *jsWebSocketConnection) SetWriteDeadline(t time.Time) error                        { return nil } // No-op in JS
-func (c *jsWebSocketConnection) SetCloseHandler(handler func(code int, text string) error) {}             // No-op in JS
+
+// The following methods are no-ops in a browser environment but are required to fulfill the interface.
+func (c *jsWebSocketConnection) SetReadDeadline(t time.Time) error                         { return nil }
+func (c *jsWebSocketConnection) SetWriteDeadline(t time.Time) error                        { return nil }
+func (c *jsWebSocketConnection) SetCloseHandler(handler func(code int, text string) error) {}

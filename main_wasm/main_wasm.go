@@ -13,6 +13,11 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
+var goBridge struct {
+	displayQRCode js.Value
+	dialWebSocket js.Value
+}
+
 var client *whatsmeow.Client
 
 func eventHandler(evt interface{}) {
@@ -23,7 +28,7 @@ func eventHandler(evt interface{}) {
 		fmt.Printf("QR code received. Total codes: %d\n", len(v.Codes))
 		if len(v.Codes) > 0 {
 			// Get the JS function we need to call from the global scope.
-			displayFunc := js.Global().Get("displayQRCode")
+			displayFunc := goBridge.displayQRCode
 			if !displayFunc.IsUndefined() {
 				// Call the JS function with the first QR code string.
 				fmt.Println("Invoking JS function displayQRCode...")
@@ -42,6 +47,13 @@ func eventHandler(evt interface{}) {
 }
 
 func main() {
+	jsBridge := js.Global()
+	goBridge.displayQRCode = jsBridge.Get("displayQRCode")
+	goBridge.dialWebSocket = jsBridge.Get("dialWebSocket")
+
+	if !goBridge.dialWebSocket.Truthy() {
+		panic("The 'dialWebSocket' function was not found in the JavaScript global scope.")
+	}
 
 	fmt.Println("WhatsMeow WASM module starting...")
 
